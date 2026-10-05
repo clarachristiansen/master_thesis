@@ -3,6 +3,11 @@ docs/site/
 # test cache
 manual_test/
 
+reports/figures/*
+!reports/figures/.gitkeep
+models/*
+!models/.gitkeep
+
 # other local dev info
 .vscode/
 

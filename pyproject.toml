@@ -36,3 +36,6 @@ extend-ignore-names = ["F", "F_*", "*_F", "*_pN"]
 
 [tool.coverage.run]
 omit = ["tests/*"]
+
+[tool.ruff.lint.per-file-ignores]
+"*.ipynb" = ["N803", "N806"]
