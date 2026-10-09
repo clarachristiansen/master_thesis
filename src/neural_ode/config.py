@@ -3,7 +3,7 @@
 A run is fully described by one :class:`ExperimentConfig`. Any field can be set
 in a YAML file or overridden with a dotted key, for example::
 
-    python -m neural_ode.run configs/base.yaml data.n_train=512 seed=1
+    python -m neural_ode.run configs/base_harmonic.yaml data.n_train=512 seed=1
 
 Fields left out of the YAML keep their defaults below.
 """
@@ -26,6 +26,7 @@ from neural_ode.train import TrainConfig
 @dataclass
 class DataConfig:
     system: str = "harmonic_oscillator"  # key in neural_ode.run.SYSTEMS
+    system_kwargs: dict[str, Any] = field(default_factory=dict)  # arguments of the system, e.g. its priors
     t_end: float = 30.0  # s, length of the training window
     dt: float = 0.5  # s per frame
     n_train: int = 128

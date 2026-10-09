@@ -55,6 +55,26 @@ class Drift(nn.Module):
         return self.net(z)
 
 
+class RadialRotationDrift(nn.Module):
+    """A 2D drift that can only rotate: dz/dt = omega(|z|^2) J z, with J a quarter turn.
+
+    The angular velocity is a learned function of the squared radius, so every
+    orbit is a circle about the origin and the radius is conserved exactly.
+    An experimental alternative to :class:`Drift` for the undamped oscillator;
+    it cannot represent the decay of a damped one.
+    """
+
+    def __init__(self, hidden_dim: int = 32):
+        super().__init__()
+        self.omega = nn.Sequential(nn.Linear(1, hidden_dim), nn.Tanh(), nn.Linear(hidden_dim, 1))
+
+    def forward(self, t: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
+        """dz/dt at latent states z of shape (batch, 2)."""
+        r2 = (z**2).sum(-1, keepdim=True)
+        rotated = torch.stack([z[:, 1], -z[:, 0]], dim=-1)
+        return self.omega(r2) * rotated
+
+
 class GRUEncoder(nn.Module):
     """Maps an observed series to z0 by running a GRU backward in time.
 

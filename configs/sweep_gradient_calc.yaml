@@ -11,5 +11,5 @@ command:
   - python
   - -m
   - neural_ode.run
-  - configs/base.yaml
+  - configs/base_harmonic.yaml
   - ${args_no_hyphens}

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Optional
+from typing import Optional, Sequence
 
 import numpy as np
 
@@ -81,16 +81,27 @@ class HarmonicOscillator(System):
     :class:`cell_simulator.dynamics.HarmonicOscillatorContraction` instead of
     Euler-Maruyama. Defaults are the priors of ``notebooks/cell_simulator_MC.ipynb``:
     omega ~ |N(0.6, 0.15^2)|, phase ~ N(0, 1.5^2) wrapped to [0, 2 pi).
+    With ``omega_range = (low, high)`` omega is uniform on that interval instead.
     """
 
     state_dim = 2
     obs_dim = 1
 
-    def __init__(self, omega_mean: float = 0.6, omega_std: float = 0.15, phase_std: float = 1.5):
+    def __init__(
+        self,
+        omega_mean: float = 0.6,
+        omega_std: float = 0.15,
+        phase_std: float = 1.5,
+        omega_range: Optional[Sequence[float]] = None,
+    ):
         self.omega_mean, self.omega_std, self.phase_std = omega_mean, omega_std, phase_std
+        self.omega_range = omega_range
 
     def sample_params(self, n: int, rng: np.random.Generator) -> Params:
-        omega = np.abs(rng.normal(self.omega_mean, self.omega_std, n))
+        if self.omega_range is None:
+            omega = np.abs(rng.normal(self.omega_mean, self.omega_std, n))
+        else:
+            omega = rng.uniform(*self.omega_range, n)
         phase = np.mod(rng.normal(0.0, self.phase_std, n), 2 * np.pi)
         return {"omega": omega, "phase": phase}
 
@@ -120,6 +131,89 @@ class HarmonicOscillator(System):
     def periods(params: Params) -> np.ndarray:
         """True oscillation period 2 pi / omega of each trajectory, in s."""
         return 2 * np.pi / params["omega"]
+
+
+class DampedOscillator(HarmonicOscillator):
+    """The contraction clock with damping: a(t) oscillates and settles at 1/2.
+
+    State (c, z) as in :class:`HarmonicOscillator`, with drift
+
+        dc = ( omega z - gamma c) dt
+        dz = (-omega c - gamma z) dt
+
+    i.e. the same rotation plus a uniform contraction at rate gamma, so in the
+    (c, z) plane every trajectory is a logarithmic spiral into the origin:
+    radius amplitude * exp(-gamma t), angle omega t + phase. Observation a = (1 + c) / 2.
+
+    Parameters, each drawn per trajectory:
+
+    - omega (rad/s) uniform on ``omega_range``, so every trajectory shows more
+      than one period in a 30 s window;
+    - phase as in :class:`HarmonicOscillator`;
+    - gamma (1/s) uniform on ``gamma_range``;
+    - amplitude, the initial radius, log-uniform on ``amplitude_range``. A decaying
+      trajectory only visits radii below its own start, so a spread of starting
+      radii is what lets the training set cover the radii met when forecasting.
+
+    A range with equal ends fixes that parameter. Parameters missing from
+    ``params`` (e.g. a grid over omega and phase only) take the values in ``defaults``.
+
+    With ``sigma = 0`` the system is deterministic and :meth:`simulate` returns
+    the exact solution. With ``sigma > 0`` additive diagonal noise sigma dW is
+    added and the base class's Euler-Maruyama is used.
+    """
+
+    def __init__(
+        self,
+        omega_range: Sequence[float] = (0.3, 0.9),
+        phase_std: float = 1.5,
+        gamma_range: Sequence[float] = (0.02, 0.1),
+        amplitude_range: Sequence[float] = (0.1, 1.0),
+        sigma: float = 0.0,
+    ):
+        super().__init__(phase_std=phase_std, omega_range=omega_range)
+        self.gamma_range, self.amplitude_range, self.sigma = gamma_range, amplitude_range, sigma
+        self.defaults = {"gamma": float(np.mean(gamma_range)), "amplitude": float(amplitude_range[1])}
+
+    def sample_params(self, n: int, rng: np.random.Generator) -> Params:
+        params = super().sample_params(n, rng)
+        params["gamma"] = rng.uniform(*self.gamma_range, n)
+        params["amplitude"] = np.exp(rng.uniform(*np.log(self.amplitude_range), n))
+        return params
+
+    def _param(self, params: Params, name: str) -> np.ndarray:
+        """``name`` per trajectory, shape (N,); its value in ``defaults`` for all when ``params`` has none."""
+        if name in params:
+            return np.asarray(params[name], dtype=float)
+        return np.full(len(params["omega"]), self.defaults[name])
+
+    def initial_state(self, params: Params, rng: np.random.Generator) -> np.ndarray:
+        return self._param(params, "amplitude")[:, None] * super().initial_state(params, rng)
+
+    def drift(self, t: float, x: np.ndarray, params: Params) -> np.ndarray:
+        omega, gamma = params["omega"], self._param(params, "gamma")
+        c, z = x[:, 0], x[:, 1]
+        return np.stack([omega * z - gamma * c, -omega * c - gamma * z], axis=-1)
+
+    def diffusion(self, t: float, x: np.ndarray, params: Params) -> Optional[np.ndarray]:
+        return None if self.sigma == 0 else np.full_like(x, self.sigma)
+
+    def simulate(
+        self, params: Params, times: np.ndarray, rng: np.random.Generator, steps_per_frame: int = 10
+    ) -> np.ndarray:
+        """Exact solution when sigma = 0, otherwise Euler-Maruyama from :class:`System`."""
+        if self.sigma > 0:
+            return System.simulate(self, params, times, rng, steps_per_frame)
+        tau = (times - times[0])[None, :]  # (1, T)
+        omega, phase = (np.asarray(params[k], dtype=float)[:, None] for k in ("omega", "phase"))
+        gamma, amplitude = (self._param(params, k)[:, None] for k in ("gamma", "amplitude"))
+        r, angle = amplitude * np.exp(-gamma * tau), omega * tau + phase  # (N, T)
+        return np.stack([r * np.sin(angle), r * np.cos(angle)], axis=-1)
+
+    @staticmethod
+    def decay_times(params: Params) -> np.ndarray:
+        """Amplitude e-folding time 1 / gamma of each trajectory, in s."""
+        return 1.0 / params["gamma"]
 
 
 # class OrnsteinUhlenbeck(System)

@@ -11,6 +11,8 @@ Metrics (:func:`evaluate`, a flat dict of floats, ready for ``wandb.log`` or JSO
 Figures (:func:`make_figures`, a dict of named matplotlib figures): the data,
 trajectory fits, latent paths, forecasts, and a parameter grid moved by the
 learned dynamics.
+Latent spaces of more than two dimensions are shown on their first two
+principal components (:class:`Projection`).
 
 Nothing here assumes a particular system. The oscillator-specific diagnostics
 (orbit frames, winding frequency, phase fits) live in ``neural_ode.evaluate_orbit``.
@@ -45,6 +47,35 @@ class GridAxis:
     name: str
     values: np.ndarray
     periodic: bool  # an angle: its lines are drawn closed
+
+
+@dataclass
+class Projection:
+    """A fixed 2D view of the latent space, shared by figures so that their axes agree.
+
+    Two latent dimensions are shown as they are. More are projected on the first two
+    principal components of the latents the projection was fitted on.
+    """
+
+    mean: np.ndarray  # (latent_dim,)
+    components: np.ndarray  # (2, latent_dim)
+    labels: tuple[str, str]
+
+    @classmethod
+    def fit(cls, latents: np.ndarray) -> Projection:
+        """The view for ``latents`` of shape (..., latent_dim), with latent_dim >= 2."""
+        dim = latents.shape[-1]
+        if dim == 2:
+            return cls(np.zeros(2), np.eye(2), ("$z_1$", "$z_2$"))
+        flat = latents.reshape(-1, dim)
+        mean = flat.mean(0)
+        _, s, vt = np.linalg.svd(flat - mean, full_matrices=False)
+        share = s**2 / np.sum(s**2)
+        return cls(mean, vt[:2], (f"PC 1 ({share[0]:.0%} of variance)", f"PC 2 ({share[1]:.0%})"))
+
+    def __call__(self, latents: np.ndarray) -> np.ndarray:
+        """Latents (..., latent_dim) in the 2D view, shape (..., 2)."""
+        return (latents - self.mean) @ self.components.T
 
 
 # --------------------------------------------------------------------------- prediction
@@ -130,17 +161,20 @@ def make_figures(
     """Standard figures of one model. Forecast and latent-flow figures only when their data are given."""
     test = splits["test"]
     pred = predict(model, test)
+    projection = Projection.fit(pred.latents) if pred.latents.shape[-1] >= 2 else None
     figures = {
         "data": plot_data(splits, color_param),
         "fits": plot_fits(test, pred),
-        "latents": plot_latents(model, test, pred, color_param),
+        "latents": plot_latents(model, test, pred, color_param, projection=projection),
     }
     if forecast_data is not None and context_frames:
         figures["forecast"] = plot_forecast(
             forecast_data, predict(model, forecast_data, context_frames), context_frames
         )
-    if grid_data is not None and grid_axes is not None and pred.latents.shape[-1] >= 2:
-        figures["latent_flow"] = plot_latent_flow(grid_data, predict(model, grid_data), grid_axes, snapshot_times)
+    if grid_data is not None and grid_axes is not None and projection is not None:
+        figures["latent_flow"] = plot_latent_flow(
+            grid_data, predict(model, grid_data), grid_axes, snapshot_times, projection
+        )
     return figures
 
 
@@ -198,54 +232,86 @@ def plot_latents(
     data: TrajectoryData,
     pred: Prediction,
     color_param: str | None = None,
+    n_paths: int | None = 10,
+    projection: Projection | None = None,
 ) -> plt.Figure:
     """Latent paths coloured by a true parameter. For a 2D latent space, over streamlines of the drift.
 
     Black dots are the encoded starting points z0. The axes are the model's own latent
-    coordinates, so the orientation differs between trained models.
+    coordinates (see :class:`Projection` for more than two dimensions), so the orientation
+    differs between trained models. Only ``n_paths`` trajectories are drawn (all if None),
+    spread evenly over ``color_param`` when given.
     """
     z = pred.latents
     dim = z.shape[-1]
     values = _param_dict(data.params).get(color_param) if color_param else None
     colors, mappable = _colors(values, len(z))
 
+    idx = np.arange(len(z))
+    if n_paths is not None and n_paths < len(z):
+        order = np.argsort(values) if values is not None else idx
+        idx = order[np.linspace(0, len(z) - 1, n_paths).round().astype(int)]
+
     fig, ax = plt.subplots(figsize=(6, 5), layout="constrained")
     if dim == 1:
-        for zi, c in zip(z, colors):
-            ax.plot(data.times, zi[:, 0], color=c, lw=0.8)
+        for i in idx:
+            ax.plot(data.times, z[i, :, 0], color=colors[i], lw=0.8)
         ax.set(xlabel="time [s]", ylabel="$z_1$", title="latent paths")
     else:
+        projection = projection or Projection.fit(z)
+        u = projection(z)
         if dim == 2:
             _drift_streamlines(ax, model, z)
-        for zi, c in zip(z, colors):
-            ax.plot(zi[:, 0], zi[:, 1], color=c, lw=0.8)
-        ax.plot(z[:, 0, 0], z[:, 0, 1], "k.", ms=3, label="$z_0$")
-        title = "latent paths" if dim == 2 else f"latent paths (first 2 of {dim} dims)"
-        ax.set(xlabel="$z_1$", ylabel="$z_2$", title=title, aspect="equal")
+        for i in idx:
+            ax.plot(u[i, :, 0], u[i, :, 1], color=colors[i], lw=0.8)
+        ax.plot(u[idx, 0, 0], u[idx, 0, 1], "k.", ms=3, label="$z_0$")
+        title = "latent paths" if dim == 2 else f"latent paths ({dim} dims, principal components)"
+        ax.set(xlabel=projection.labels[0], ylabel=projection.labels[1], title=title, aspect="equal")
         ax.legend(frameon=False, fontsize=8, loc="upper right")
     if mappable is not None:
         fig.colorbar(mappable, ax=ax, label=f"true {color_param}", shrink=0.8)
     return fig
 
 
-def plot_forecast(data: TrajectoryData, pred: Prediction, context_frames: int, channel: int = 0) -> plt.Figure:
-    """Squared error over time (mean and median over trajectories), and the median forecast."""
-    err = ((pred.observations - data.observations) ** 2).mean(-1)  # (N, T)
+def plot_forecast(
+    data: TrajectoryData,
+    pred: Prediction,
+    context_frames: int,
+    channel: int = 0,
+    quantiles: Sequence[float] = (0.1, 0.5, 0.9),
+) -> plt.Figure:
+    """Forecast error over time relative to each trajectory's own variance, and example forecasts.
+
+    The squared error of a trajectory is divided by the variance of its observations in the
+    context window, so 1 means "no better than that trajectory's mean" whatever its amplitude.
+    The band is the 25-75 % range over trajectories. The examples are the trajectories at
+    ``quantiles`` of that relative error after the context window, from good to bad.
+    """
+    scale = data.observations[:, :context_frames].var(axis=(1, 2))  # (N,)
+    err = ((pred.observations - data.observations) ** 2).mean(-1) / scale[:, None]  # (N, T)
+    future = err[:, context_frames:].mean(1)
+    order = np.argsort(future)
     t_end = data.times[context_frames - 1]
-    fig, (ax_e, ax_x) = plt.subplots(1, 2, figsize=(12, 3.8), layout="constrained")
+    n = 1 + len(quantiles)
+    fig, axes = plt.subplots(1, n, figsize=(4.4 * n, 3.6), layout="constrained")
 
-    ax_e.semilogy(data.times, err.mean(0), label="mean")
-    ax_e.semilogy(data.times, np.median(err, 0), label="median")
-    ax_e.set(xlabel="time [s]", ylabel="squared error", title="forecast error")
-    ax_e.legend(frameon=False)
+    low, median, high = np.quantile(err, [0.25, 0.5, 0.75], axis=0)
+    axes[0].fill_between(data.times, low, high, alpha=0.25, label="25-75 %")
+    axes[0].semilogy(data.times, median, label="median")
+    axes[0].semilogy(data.times, err.mean(0), label="mean")
+    axes[0].axhline(1.0, color="0.6", lw=0.8)  # the trajectory's own mean as a forecast
+    axes[0].set(xlabel="time [s]", ylabel="squared error / trajectory variance", title="forecast error")
+    axes[0].legend(frameon=False, fontsize=8)
 
-    k = int(np.argsort(err[:, context_frames:].mean(1))[len(err) // 2])
-    ax_x.plot(data.times, data.observations[k, :, channel], color="0.3", label="data")
-    ax_x.plot(data.times, pred.observations[k, :, channel], ls="--", label="model")
-    ax_x.set(xlabel="time [s]", ylabel=f"observation {channel}", title="median forecast")
-    ax_x.legend(frameon=False, fontsize=8)
+    for ax, q in zip(axes[1:], quantiles):
+        k = order[int(round(q * (len(order) - 1)))]
+        ax.plot(data.times, data.observations[k, :, channel], color="0.3", label="data")
+        ax.plot(data.times, pred.observations[k, :, channel], ls="--", label="model")
+        ax.set(xlabel="time [s]", title=f"{q:.0%} quantile: relative error {future[k]:.2g}")
+    axes[1].set_ylabel(f"observation {channel}")
+    axes[1].legend(frameon=False, fontsize=8)
 
-    for ax in (ax_e, ax_x):
+    for ax in axes:
         ax.axvline(t_end, color="k", lw=0.8, ls=":")  # end of what the encoder sees
     return fig
 
@@ -255,6 +321,7 @@ def plot_latent_flow(
     pred: Prediction,
     axes: Sequence[GridAxis],
     snapshot_times: Sequence[float],
+    projection: Projection | None = None,
 ) -> plt.Figure:
     """A regular grid of unseen parameters, encoded and then moved by the learned dynamics.
 
@@ -263,10 +330,12 @@ def plot_latent_flow(
     Black dots mark the first value of the second parameter on each coloured line
     (phase 0 for an oscillator), so their spread shows how far each line has turned.
     A grid that stays untangled over time means the dynamics keep parameters apart.
+    The latents are shown in ``projection`` (fitted on the grid's own latents if None).
     """
     a, b = axes
     params = _param_dict(data.params)
-    u = pred.latents[..., :2]  # (N, T, 2): first two latent dimensions
+    projection = projection or Projection.fit(pred.latents)
+    u = projection(pred.latents)  # (N, T, 2)
     lines = []  # one index array per value of a, ordered along b
     for value in a.values:
         idx = np.where(np.isclose(params[a.name], value))[0]
@@ -291,7 +360,7 @@ def plot_latent_flow(
         first = u[[idx[0] for idx in lines], k]
         ax.scatter(first[:, 0], first[:, 1], color="k", s=15, zorder=3)
         ax.set(xlim=(lo[0], hi[0]), ylim=(lo[1], hi[1]), aspect="equal", title=f"t = {data.times[k]:g} s")
-    panels[0, 0].set(xlabel="$z_1$", ylabel="$z_2$")
+    panels[0, 0].set(xlabel=projection.labels[0], ylabel=projection.labels[1])
     fig.colorbar(mpl.cm.ScalarMappable(norm=norm, cmap=cmap), ax=panels[0], label=f"true {a.name}", shrink=0.8)
     fig.suptitle(f"Parameter grid moved by the learned dynamics (dots: {b.name} = {b.values[0]:g})")
     return fig

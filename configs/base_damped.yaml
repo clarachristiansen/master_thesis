@@ -1,12 +1,16 @@
 # Baseline Neural ODE experiment. Sweeps and command-line overrides change one key at a time,
-# e.g.  python -m neural_ode.run configs/base.yaml data.n_train=512 seed=1
+# e.g.  python -m neural_ode.run configs/base_damped.yaml data.n_train=512 seed=1
 # Keys left out keep the defaults in src/neural_ode/config.py.
 
-name: neural_ode
+name: neural_ode_damped
 seed: 0                    # model init and batch order
 
 data:
-  system: harmonic_oscillator
+  system: damped_oscillator
+  system_kwargs:           # priors, see DampedOscillator
+    omega_range: [0.3, 0.9]      # rad/s, uniform
+    gamma_range: [0.02, 0.1]     # 1/s, uniform
+    amplitude_range: [0.1, 1.0]  # initial radius, log-uniform
   t_end: 30.0              # s, training window
   dt: 0.5                  # s per frame
   n_train: 256
@@ -15,7 +19,7 @@ data:
   seed: 0                  # keep fixed across runs
 
 model:
-  latent_dim: 2
+  latent_dim: 4
   decoder: mlp             # mlp | linear
   drift_hidden_dim: 64
   steps_per_frame: 1
@@ -24,13 +28,14 @@ model:
 
 train:                     # any TrainConfig field can go here
   n_iters: 4000
+  loss: nmse               # mse | nmse (per trajectory, so small amplitudes count)
 
 eval:
   forecast_t_end: 60.0     # s; <= data.t_end switches forecasting off
   n_forecast: 256
 
 plots:                     # figures only; not part of the W&B config
-  color_param: omega
+  color_param: gamma
   grid:                    # parameter grid for the latent-flow plot; remove to skip it
     omega: [0.35, 0.85, 6] # linspace(start, stop, num)
     phase: 12              # an angle: 12 points round the circle

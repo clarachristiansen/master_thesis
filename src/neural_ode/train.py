@@ -21,6 +21,7 @@ class TrainConfig:
     batch_size: int = 32
     eval_every: int = 50
     seed: int = 0
+    loss: str = "mse"  # key in LOSSES
 
 
 @dataclass
@@ -38,16 +39,30 @@ def trajectory_mse(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     return torch.mean((pred - target) ** 2)
 
 
+def trajectory_nmse(pred: torch.Tensor, target: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    """MSE of each trajectory divided by the variance of its own target, averaged over trajectories.
+
+    Every trajectory then counts the same whatever its amplitude: 1 means "no better
+    than that trajectory's mean". With :func:`trajectory_mse` a trajectory of a tenth
+    the amplitude contributes a hundredth of the loss. Inputs have shape (N, T, obs_dim).
+    """
+    mse = ((pred - target) ** 2).mean(dim=(1, 2))
+    return torch.mean(mse / (target.var(dim=(1, 2), unbiased=False) + eps))
+
+
+LOSSES = {"mse": trajectory_mse, "nmse": trajectory_nmse}
+
+
 @torch.no_grad()
-def reconstruction_loss(model: LatentODE, data: TrajectoryData) -> float:
-    """:func:`trajectory_mse` of the model's reconstruction of every trajectory in ``data``."""
+def reconstruction_loss(model: LatentODE, data: TrajectoryData, loss: str = "mse") -> float:
+    """The loss ``LOSSES[loss]`` of the model's reconstruction of every trajectory in ``data``."""
     times, obs = data.tensors()
     pred, _ = model(times, obs)
-    return float(trajectory_mse(pred, obs))
+    return float(LOSSES[loss](pred, obs))
 
 
 def train(model: LatentODE, train_data: TrajectoryData, val_data: TrajectoryData, config: TrainConfig) -> TrainHistory:
-    """Fit ``model`` by minimising the trajectory MSE of its reconstructions with Adam.
+    """Fit ``model`` by minimising the loss ``LOSSES[config.loss]`` of its reconstructions with Adam.
 
     Each iteration encodes a random mini-batch of trajectories, integrates
     their latent ODEs and decodes them. With ``config.window_frames`` set, the
@@ -67,6 +82,9 @@ def train(model: LatentODE, train_data: TrajectoryData, val_data: TrajectoryData
     Returns:
         The loss history; ``model`` is modified in place.
     """
+    if config.loss not in LOSSES:
+        raise ValueError(f"loss must be one of {sorted(LOSSES)}, got {config.loss!r}")
+    loss_fn = LOSSES[config.loss]
     torch.manual_seed(config.seed)
     rng = np.random.default_rng(config.seed)
     times, obs = train_data.tensors()
@@ -80,7 +98,7 @@ def train(model: LatentODE, train_data: TrajectoryData, val_data: TrajectoryData
         window = slice(None)
         target = obs[batch][:, window]
         pred, latents = model(times[window] - times[window][0], target)
-        loss = trajectory_mse(pred, target)
+        loss = loss_fn(pred, target)
         optimizer.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
@@ -88,9 +106,9 @@ def train(model: LatentODE, train_data: TrajectoryData, val_data: TrajectoryData
         scheduler.step()
 
         if it % config.eval_every == 0 or it == config.n_iters:
-            val = reconstruction_loss(model, val_data)
+            val = reconstruction_loss(model, val_data, config.loss)
             history.iters.append(it)
-            history.train_loss.append(reconstruction_loss(model, train_data))
+            history.train_loss.append(reconstruction_loss(model, train_data, config.loss))
             history.val_loss.append(val)
             if val < best_val:
                 best_val, best_state, history.best_iter = val, copy.deepcopy(model.state_dict()), it

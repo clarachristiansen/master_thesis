@@ -1,6 +1,6 @@
 """Train, evaluate and log one experiment.
 
-    python -m neural_ode.run configs/base.yaml data.n_train=512 seed=1
+    python -m neural_ode.run configs/base_harmonic.yaml data.n_train=512 seed=1
 
 A run saves
 - ``out_dir/name/run_id/``: ``config.yaml``, ``model.pt`` and ``metrics.json``;
@@ -28,18 +28,18 @@ from neural_ode.config import ExperimentConfig, load_config, save_config, to_dic
 from neural_ode.data import TrajectoryData, make_splits, parameter_grid
 from neural_ode.evaluate import GridAxis, evaluate, make_figures
 from neural_ode.model import LatentODE
-from neural_ode.system import HarmonicOscillator
+from neural_ode.system import DampedOscillator, HarmonicOscillator
 from neural_ode.train import TrainHistory, train
 
 SYSTEMS = {
     "harmonic_oscillator": HarmonicOscillator,
-    # "damped_oscillator": DampedOscillator,
+    "damped_oscillator": DampedOscillator,
 }
 
 
 def build_data(cfg: ExperimentConfig) -> tuple[dict[str, TrajectoryData], TrajectoryData | None, Any]:
     """Train/val/test splits, longer forecast trajectories with fresh parameters (or None), and the system."""
-    system = SYSTEMS[cfg.data.system]()
+    system = SYSTEMS[cfg.data.system](**cfg.data.system_kwargs)
     d = cfg.data
     splits = make_splits(system, d.times(), d.n_train, d.n_val, d.n_test, seed=d.seed)
     forecast = None
@@ -118,7 +118,7 @@ def run(cfg: ExperimentConfig) -> dict[str, float]:
         color_param=cfg.plots.color_param,
         snapshot_times=cfg.plots.snapshot_times,
     )
-    figures["history"] = plot_history(history)
+    figures["history"] = plot_history(history, cfg.train.loss)
     for name, fig in figures.items():
         fig.savefig(fig_dir / f"{name}.png", bbox_inches="tight")
 
@@ -142,12 +142,13 @@ def run(cfg: ExperimentConfig) -> dict[str, float]:
     return metrics
 
 
-def plot_history(history: TrainHistory) -> plt.Figure:
-    """Training and validation loss against iteration."""
+def plot_history(history: TrainHistory, loss: str = "mse") -> plt.Figure:
+    """Training and validation loss against iteration; ``loss`` is the TrainConfig.loss that was minimised."""
     fig, ax = plt.subplots(figsize=(5, 3.4), layout="constrained")
     for name, (x, y) in _history_curves(history).items():
         ax.semilogy(x, y, label=name)
-    ax.set(xlabel="iteration", ylabel="MSE", title="training history")
+    ylabel = "per-trajectory nMSE" if loss == "nmse" else loss.upper()
+    ax.set(xlabel="iteration", ylabel=ylabel, title="training history")
     ax.legend(frameon=False, fontsize=8)
     return fig
 
