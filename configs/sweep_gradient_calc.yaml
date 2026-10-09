@@ -1,0 +1,15 @@
+project: Master's Thesis
+name: gradient_calc
+method: grid
+parameters:
+  model.gradient:
+    values: ['backprop', 'adjoint']   # 64 is the current default
+  seed:
+    values: [0, 1, 2]
+command:
+  - ${env}
+  - python
+  - -m
+  - neural_ode.run
+  - configs/base.yaml
+  - ${args_no_hyphens}

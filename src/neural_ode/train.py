@@ -13,11 +13,7 @@ from neural_ode.model import LatentODE
 
 @dataclass
 class TrainConfig:
-    """Optimisation settings for :func:`train`.
-
-    ``window_frames``: if set, each iteration trains on a random window of this
-    many frames instead of the whole trajectory (see :func:`train`).
-    """
+    """Optimisation settings for :func:`train`."""
 
     n_iters: int = 3000
     lr: float = 3e-3
@@ -25,7 +21,6 @@ class TrainConfig:
     batch_size: int = 32
     eval_every: int = 50
     seed: int = 0
-    window_frames: Optional[int] = None
 
 
 @dataclass
@@ -83,9 +78,6 @@ def train(model: LatentODE, train_data: TrajectoryData, val_data: TrajectoryData
     for it in range(1, config.n_iters + 1):
         batch = rng.choice(len(train_data), size=min(config.batch_size, len(train_data)), replace=False)
         window = slice(None)
-        if config.window_frames is not None:
-            start = int(rng.integers(0, len(times) - config.window_frames + 1))
-            window = slice(start, start + config.window_frames)
         target = obs[batch][:, window]
         pred, latents = model(times[window] - times[window][0], target)
         loss = trajectory_mse(pred, target)

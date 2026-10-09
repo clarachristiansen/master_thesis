@@ -8,10 +8,10 @@ import torch
 
 from cell_simulator.visualize import COLORS, set_style
 from neural_ode.data import TrajectoryData
-from neural_ode.evaluate import (
+from neural_ode.evaluate import Prediction
+from neural_ode.evaluate_orbit import (
     LatentDiagnostics,
     OrbitFrame,
-    Prediction,
     fit_phase_per_omega,
     initial_phases,
     orbit_coordinates,

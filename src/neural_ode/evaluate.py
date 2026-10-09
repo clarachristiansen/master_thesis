@@ -1,7 +1,28 @@
+"""Generic evaluation of a trained LatentODE.
+
+Metrics (:func:`evaluate`, a flat dict of floats, ready for ``wandb.log`` or JSON):
+
+- Reconstruction: nMSE on train, val and test, and the val/train ratio
+  (the overfitting signal).
+- Dynamics: forecast nMSE beyond the training window. The encoder sees the
+  first ``context_frames`` frames, the latent ODE is integrated on, and the
+  decoded continuation is compared with the data.
+
+Figures (:func:`make_figures`, a dict of named matplotlib figures): the data,
+trajectory fits, latent paths, forecasts, and a parameter grid moved by the
+learned dynamics.
+
+Nothing here assumes a particular system. The oscillator-specific diagnostics
+(orbit frames, winding frequency, phase fits) live in ``neural_ode.evaluate_orbit``.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any, Sequence
 
+import matplotlib as mpl
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
@@ -18,227 +39,304 @@ class Prediction:
 
 
 @dataclass
-class FitMetrics:
-    """How well predicted observations match the ground truth.
+class GridAxis:
+    """One parameter of the grid in :func:`plot_latent_flow`."""
 
-    ``nmse`` is the MSE divided by the variance of the target, so 1 means
-    "no better than predicting the mean" and 0 is a perfect fit.
-    """
+    name: str
+    values: np.ndarray
+    periodic: bool  # an angle: its lines are drawn closed
 
-    mse: float
-    rmse: float
-    nmse: float
-    per_trajectory_mse: np.ndarray  # (N,)
-    per_frame_mse: np.ndarray  # (T,)
+
+# --------------------------------------------------------------------------- prediction
 
 
 @torch.no_grad()
-def predict(model: LatentODE, data: TrajectoryData) -> Prediction:
-    """Encode, integrate and decode every trajectory in ``data``."""
+def predict(model: LatentODE, data: TrajectoryData, context_frames: int | None = None) -> Prediction:
+    """Encode, integrate and decode every trajectory in ``data``.
+
+    With ``context_frames`` set, the encoder sees only the first ``context_frames``
+    frames, and the model is integrated over all of ``data.times``: a forecast.
+    """
+    model.eval()
     times, obs = data.tensors()
-    pred, latents = model(times, obs)
+    if context_frames is None:
+        pred, latents = model(times, obs)
+    else:
+        latents = model.integrate(model.encoder(obs[:, :context_frames]), times)
+        pred = model.decoder(latents)
     return Prediction(pred.numpy(), latents.numpy())
 
 
 @torch.no_grad()
 def encode(model: LatentODE, data: TrajectoryData) -> np.ndarray:
     """Encoded initial states z0 of every trajectory in ``data``, shape (N, latent_dim)."""
-    return model.encoder(torch.as_tensor(data.observations, dtype=torch.float32)).numpy()
+    model.eval()
+    _, obs = data.tensors()
+    return model.encoder(obs).numpy()
 
 
-def fit_metrics(pred: np.ndarray, target: np.ndarray) -> FitMetrics:
-    """Error metrics between predicted and target observations, both of shape (N, T, obs_dim)."""
-    err = (pred - target) ** 2
-    mse = float(err.mean())
-    return FitMetrics(
-        mse=mse,
-        rmse=float(np.sqrt(mse)),
-        nmse=mse / float(target.var()),
-        per_trajectory_mse=err.mean(axis=(1, 2)),
-        per_frame_mse=err.mean(axis=(0, 2)),
+# --------------------------------------------------------------------------- metrics
+
+
+def nmse(pred: np.ndarray, target: np.ndarray) -> float:
+    """MSE divided by the variance of the target: 1 means "no better than the mean", 0 is perfect."""
+    return float(np.mean((pred - target) ** 2) / np.var(target))
+
+
+def evaluate(
+    model: LatentODE,
+    splits: dict[str, TrajectoryData],
+    forecast_data: TrajectoryData | None = None,
+    *,
+    context_frames: int | None = None,
+) -> dict[str, float]:
+    """All scalar metrics of one model, as a flat dict.
+
+    Args:
+        splits: "train", "val" and "test" data.
+        forecast_data: Trajectories longer than the training window, or None to skip forecasting.
+        context_frames: Frames the encoder sees when forecasting (the training window length).
+    """
+    metrics = {}
+    for name in ("train", "val", "test"):
+        data = splits[name]
+        metrics[f"{name}/nmse"] = nmse(predict(model, data).observations, data.observations)
+    metrics["gap/val_over_train"] = metrics["val/nmse"] / metrics["train/nmse"]
+
+    if forecast_data is not None:
+        if not context_frames:
+            raise ValueError("forecasting needs context_frames")
+        pred = predict(model, forecast_data, context_frames).observations
+        obs = forecast_data.observations
+        metrics["forecast/nmse_context"] = nmse(pred[:, :context_frames], obs[:, :context_frames])
+        metrics["forecast/nmse_future"] = nmse(pred[:, context_frames:], obs[:, context_frames:])
+    return metrics
+
+
+# --------------------------------------------------------------------------- figures
+
+
+def make_figures(
+    model: LatentODE,
+    splits: dict[str, TrajectoryData],
+    forecast_data: TrajectoryData | None = None,
+    grid_data: TrajectoryData | None = None,
+    grid_axes: Sequence[GridAxis] | None = None,
+    *,
+    context_frames: int | None = None,
+    color_param: str | None = None,
+    snapshot_times: Sequence[float] = (0.0, 2.5, 5.0, 10.0),
+) -> dict[str, plt.Figure]:
+    """Standard figures of one model. Forecast and latent-flow figures only when their data are given."""
+    test = splits["test"]
+    pred = predict(model, test)
+    figures = {
+        "data": plot_data(splits, color_param),
+        "fits": plot_fits(test, pred),
+        "latents": plot_latents(model, test, pred, color_param),
+    }
+    if forecast_data is not None and context_frames:
+        figures["forecast"] = plot_forecast(
+            forecast_data, predict(model, forecast_data, context_frames), context_frames
+        )
+    if grid_data is not None and grid_axes is not None and pred.latents.shape[-1] >= 2:
+        figures["latent_flow"] = plot_latent_flow(grid_data, predict(model, grid_data), grid_axes, snapshot_times)
+    return figures
+
+
+def plot_data(splits: dict[str, TrajectoryData], color_param: str | None = None, n_examples: int = 4) -> plt.Figure:
+    """Example training trajectories, and the true parameters of each split (if the data have any)."""
+    train = splits["train"]
+    params = {name: _param_dict(splits[name].params) for name in ("train", "val", "test")}
+    names = list(params["train"])
+    key = color_param if color_param in params["train"] else (names[0] if names else None)
+
+    if names:
+        fig, (ax_p, ax_x) = plt.subplots(1, 2, figsize=(12, 3.8), layout="constrained", width_ratios=[1, 1.8])
+    else:
+        fig, ax_x = plt.subplots(figsize=(7, 3.8), layout="constrained")
+
+    order = np.argsort(params["train"][key]) if key else np.arange(len(train.observations))
+    for k in order[np.linspace(0, len(order) - 1, n_examples).round().astype(int)]:
+        label = ", ".join(f"{n} = {params['train'][n][k]:.2f}" for n in names) or None
+        ax_x.plot(train.times, train.observations[k, :, 0], label=label)
+    ax_x.set(xlabel="time [s]", ylabel="observation 0", title="example training trajectories")
+    if names:
+        ax_x.legend(frameon=False, fontsize=8, loc="upper left", bbox_to_anchor=(1.01, 1.0))
+
+        markers = {"train": "o", "val": "s", "test": "^"}
+        if len(names) >= 2:
+            other = next(n for n in names if n != key)
+            for split, marker in markers.items():
+                ax_p.scatter(params[split][key], params[split][other], s=12, marker=marker, alpha=0.8, label=split)
+            ax_p.set(xlabel=key, ylabel=other, title="true parameters")
+        else:
+            for split in markers:
+                ax_p.hist(params[split][key], bins=20, alpha=0.6, label=split)
+            ax_p.set(xlabel=key, ylabel="count", title="true parameter")
+        ax_p.legend(frameon=False, fontsize=8)
+    return fig
+
+
+def plot_fits(data: TrajectoryData, pred: Prediction, channel: int = 0) -> plt.Figure:
+    """The best and worst test trajectory by per-trajectory MSE."""
+    per_traj = ((pred.observations - data.observations) ** 2).mean(axis=(1, 2))
+    order = np.argsort(per_traj)
+    picks = {"best": order[0], "worst": order[-1]}
+    fig, axes = plt.subplots(1, len(picks), figsize=(4.5 * len(picks), 3.2), layout="constrained", sharey=True)
+    for ax, (label, k) in zip(axes, picks.items()):
+        ax.plot(data.times, data.observations[k, :, channel], color="0.3", label="data")
+        ax.plot(data.times, pred.observations[k, :, channel], ls="--", label="model")
+        ax.set(xlabel="time [s]", title=f"{label}: MSE {per_traj[k]:.1e}")
+    axes[0].set_ylabel(f"observation {channel}")
+    axes[0].legend(frameon=False, fontsize=8)
+    return fig
+
+
+def plot_latents(
+    model: LatentODE,
+    data: TrajectoryData,
+    pred: Prediction,
+    color_param: str | None = None,
+) -> plt.Figure:
+    """Latent paths coloured by a true parameter. For a 2D latent space, over streamlines of the drift.
+
+    Black dots are the encoded starting points z0. The axes are the model's own latent
+    coordinates, so the orientation differs between trained models.
+    """
+    z = pred.latents
+    dim = z.shape[-1]
+    values = _param_dict(data.params).get(color_param) if color_param else None
+    colors, mappable = _colors(values, len(z))
+
+    fig, ax = plt.subplots(figsize=(6, 5), layout="constrained")
+    if dim == 1:
+        for zi, c in zip(z, colors):
+            ax.plot(data.times, zi[:, 0], color=c, lw=0.8)
+        ax.set(xlabel="time [s]", ylabel="$z_1$", title="latent paths")
+    else:
+        if dim == 2:
+            _drift_streamlines(ax, model, z)
+        for zi, c in zip(z, colors):
+            ax.plot(zi[:, 0], zi[:, 1], color=c, lw=0.8)
+        ax.plot(z[:, 0, 0], z[:, 0, 1], "k.", ms=3, label="$z_0$")
+        title = "latent paths" if dim == 2 else f"latent paths (first 2 of {dim} dims)"
+        ax.set(xlabel="$z_1$", ylabel="$z_2$", title=title, aspect="equal")
+        ax.legend(frameon=False, fontsize=8, loc="upper right")
+    if mappable is not None:
+        fig.colorbar(mappable, ax=ax, label=f"true {color_param}", shrink=0.8)
+    return fig
+
+
+def plot_forecast(data: TrajectoryData, pred: Prediction, context_frames: int, channel: int = 0) -> plt.Figure:
+    """Squared error over time (mean and median over trajectories), and the median forecast."""
+    err = ((pred.observations - data.observations) ** 2).mean(-1)  # (N, T)
+    t_end = data.times[context_frames - 1]
+    fig, (ax_e, ax_x) = plt.subplots(1, 2, figsize=(12, 3.8), layout="constrained")
+
+    ax_e.semilogy(data.times, err.mean(0), label="mean")
+    ax_e.semilogy(data.times, np.median(err, 0), label="median")
+    ax_e.set(xlabel="time [s]", ylabel="squared error", title="forecast error")
+    ax_e.legend(frameon=False)
+
+    k = int(np.argsort(err[:, context_frames:].mean(1))[len(err) // 2])
+    ax_x.plot(data.times, data.observations[k, :, channel], color="0.3", label="data")
+    ax_x.plot(data.times, pred.observations[k, :, channel], ls="--", label="model")
+    ax_x.set(xlabel="time [s]", ylabel=f"observation {channel}", title="median forecast")
+    ax_x.legend(frameon=False, fontsize=8)
+
+    for ax in (ax_e, ax_x):
+        ax.axvline(t_end, color="k", lw=0.8, ls=":")  # end of what the encoder sees
+    return fig
+
+
+def plot_latent_flow(
+    data: TrajectoryData,
+    pred: Prediction,
+    axes: Sequence[GridAxis],
+    snapshot_times: Sequence[float],
+) -> plt.Figure:
+    """A regular grid of unseen parameters, encoded and then moved by the learned dynamics.
+
+    Each panel shows where the grid's trajectories are at one time. Coloured lines join
+    equal values of the first grid parameter; dashed lines join equal values of the second.
+    Black dots mark the first value of the second parameter on each coloured line
+    (phase 0 for an oscillator), so their spread shows how far each line has turned.
+    A grid that stays untangled over time means the dynamics keep parameters apart.
+    """
+    a, b = axes
+    params = _param_dict(data.params)
+    u = pred.latents[..., :2]  # (N, T, 2): first two latent dimensions
+    lines = []  # one index array per value of a, ordered along b
+    for value in a.values:
+        idx = np.where(np.isclose(params[a.name], value))[0]
+        lines.append(idx[np.argsort(params[b.name][idx])])
+
+    shown = [int(np.searchsorted(data.times, t)) for t in snapshot_times if t <= data.times[-1] + 1e-9]
+    pts = u[:, shown].reshape(-1, 2)
+    pad = 0.08 * (pts.max(0) - pts.min(0))
+    lo, hi = pts.min(0) - pad, pts.max(0) + pad
+    cmap, norm = plt.get_cmap("viridis"), mpl.colors.Normalize(a.values.min(), a.values.max())
+
+    fig, panels = plt.subplots(1, len(shown), figsize=(4 * len(shown), 4.3), layout="constrained", squeeze=False)
+    for ax, k in zip(panels[0], shown):
+        for value, idx in zip(a.values, lines):
+            p = u[idx, k]
+            if b.periodic:
+                p = np.vstack([p, p[:1]])
+            ax.plot(p[:, 0], p[:, 1], color=cmap(norm(value)), lw=1.5)
+        for j in range(min(len(idx) for idx in lines)):
+            p = u[[idx[j] for idx in lines], k]
+            ax.plot(p[:, 0], p[:, 1], ls="--", color="0.6", lw=0.7)
+        first = u[[idx[0] for idx in lines], k]
+        ax.scatter(first[:, 0], first[:, 1], color="k", s=15, zorder=3)
+        ax.set(xlim=(lo[0], hi[0]), ylim=(lo[1], hi[1]), aspect="equal", title=f"t = {data.times[k]:g} s")
+    panels[0, 0].set(xlabel="$z_1$", ylabel="$z_2$")
+    fig.colorbar(mpl.cm.ScalarMappable(norm=norm, cmap=cmap), ax=panels[0], label=f"true {a.name}", shrink=0.8)
+    fig.suptitle(f"Parameter grid moved by the learned dynamics (dots: {b.name} = {b.values[0]:g})")
+    return fig
+
+
+# --------------------------------------------------------------------------- helpers
+
+
+@torch.no_grad()
+def _drift_streamlines(ax: plt.Axes, model: LatentODE, z: np.ndarray, n_grid: int = 30) -> None:
+    """Streamlines of the learned drift over the region the latents occupy (2D latent space, autonomous drift)."""
+    flat = z.reshape(-1, 2)
+    lo, hi = flat.min(0), flat.max(0)
+    pad = 0.1 * (hi - lo)
+    xx, yy = np.meshgrid(
+        np.linspace(lo[0] - pad[0], hi[0] + pad[0], n_grid),
+        np.linspace(lo[1] - pad[1], hi[1] + pad[1], n_grid),
+    )
+    dtype = next(model.parameters()).dtype
+    grid = torch.as_tensor(np.column_stack([xx.ravel(), yy.ravel()]), dtype=dtype)
+    f = model.drift(torch.zeros((), dtype=dtype), grid).numpy()
+    ax.streamplot(
+        xx,
+        yy,
+        f[:, 0].reshape(xx.shape),
+        f[:, 1].reshape(yy.shape),
+        color="0.8",
+        density=1.0,
+        linewidth=0.6,
+        arrowsize=0.7,
     )
 
 
-@dataclass
-class OrbitFrame:
-    """Orthonormal latent coordinates adapted to a family of orbits.
-
-    Columns 0 and 1 of ``basis`` span the rotation plane, the plane in which
-    trajectories circulate. Column 2 (only if latent_dim >= 3) is the
-    direction orthogonal to that plane along which the orbit centres spread
-    most: where a cylinder-like latent space stores omega. Signs of the
-    columns are arbitrary.
-    """
-
-    basis: np.ndarray  # (latent_dim, min(latent_dim, 3))
-    origin: np.ndarray  # (latent_dim,) mean of all latents
-
-    def project(self, latents: np.ndarray) -> np.ndarray:
-        """Coordinates (u, v[, w]) of latents (..., latent_dim) in this frame."""
-        return (latents - self.origin) @ self.basis
+def _colors(values: np.ndarray | None, n: int) -> tuple[list, mpl.cm.ScalarMappable | None]:
+    """One colour per trajectory from ``values`` (viridis), or a single colour if there are none."""
+    if values is None:
+        return ["C0"] * n, None
+    cmap, norm = plt.get_cmap("viridis"), mpl.colors.Normalize(values.min(), values.max())
+    return [cmap(norm(v)) for v in values], mpl.cm.ScalarMappable(norm=norm, cmap=cmap)
 
 
-def orbit_frame(latents: np.ndarray) -> OrbitFrame:
-    """:class:`OrbitFrame` of latent trajectories (N, T, latent_dim).
-
-    The rotation plane is the top-2 principal plane of the latents after
-    centring each trajectory on its own centroid, which removes the offsets
-    between orbits and keeps the circulation. The third axis is the top
-    principal direction of the orbit centroids within the orthogonal complement.
-    """
-    dim = latents.shape[-1]
-    centred = latents - latents.mean(axis=1, keepdims=True)
-    _, _, vt = np.linalg.svd(centred.reshape(-1, dim), full_matrices=True)
-    plane = vt[:2].T
-    if dim < 3:
-        return OrbitFrame(plane, latents.reshape(-1, dim).mean(axis=0))
-    complement = vt[2:].T
-    centroids = latents.mean(axis=1)
-    spread = (centroids - centroids.mean(axis=0)) @ complement
-    _, _, vt_c = np.linalg.svd(spread, full_matrices=True)
-    axis = complement @ vt_c[0]
-    return OrbitFrame(np.column_stack([plane, axis]), latents.reshape(-1, dim).mean(axis=0))
-
-
-@dataclass
-class OrbitCoordinates:
-    """Per-trajectory normalised coordinates in the rotation plane.
-
-    Each trajectory's projection on the rotation plane is fitted with an
-    ellipse, and mapped by an orientation-preserving (symmetric) linear map
-    onto the unit circle centred at 0. Any orbit that is an affine image of a
-    circle therefore becomes the unit circle, however much of it was sampled,
-    and the sense of rotation stays comparable across trajectories.
-    """
-
-    plane: np.ndarray  # (latent_dim, 2)
-    centroids: np.ndarray  # (N, latent_dim) orbit centres: ellipse centre in-plane, mean out-of-plane
-    transforms: np.ndarray  # (N, 2, 2)
-
-    def __call__(self, latents: np.ndarray) -> np.ndarray:
-        """Normalised coordinates of latents (N, T, latent_dim) of the same N trajectories; returns (N, T, 2)."""
-        return np.einsum("ntd,nde->nte", (latents - self.centroids[:, None]) @ self.plane, self.transforms)
-
-    def radius(self, latents: np.ndarray) -> np.ndarray:
-        """Normalised distance from each trajectory's orbit centre, shape (N, T); ~1 on its own orbit."""
-        return np.linalg.norm(self(latents), axis=-1)
-
-
-def _fit_ellipse(pts: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """Centre (2,) and symmetric map (2, 2) taking the ellipse through points (T, 2) to the unit circle.
-
-    Least-squares conic fit a x^2 + b xy + c y^2 + d x + e y = 1 (points are
-    centred first for conditioning). If the fitted conic is not an ellipse,
-    falls back to the points' mean and covariance.
-    """
-    mean = pts.mean(axis=0)
-    x, y = (pts - mean).T
-    p, *_ = np.linalg.lstsq(np.column_stack([x**2, x * y, y**2, x, y]), np.ones(len(pts)), rcond=None)
-    q = np.array([[p[0], p[1] / 2], [p[1] / 2, p[2]]])
-    evals, evecs = np.linalg.eigh(q)
-    if np.all(evals > 0):
-        centre = -0.5 * np.linalg.solve(q, p[3:])
-        k = 1.0 + centre @ q @ centre
-        if k > 0:
-            return mean + centre, evecs @ np.diag(np.sqrt(evals / k)) @ evecs.T
-    evals, evecs = np.linalg.eigh(np.cov(pts.T))
-    inv_sqrt = evecs @ np.diag(1 / np.sqrt(evals)) @ evecs.T
-    return mean, inv_sqrt / np.mean(np.linalg.norm((pts - mean) @ inv_sqrt, axis=-1))
-
-
-def orbit_coordinates(latents: np.ndarray, frame: OrbitFrame) -> OrbitCoordinates:
-    """:class:`OrbitCoordinates` fitted to latent trajectories (N, T, latent_dim) in ``frame``."""
-    plane = frame.basis[:, :2]
-    means = latents.mean(axis=1)
-    centroids, transforms = [], []
-    for mean, pts in zip(means, (latents - means[:, None]) @ plane):
-        centre, transform = _fit_ellipse(pts)
-        centroids.append(mean + plane @ centre)
-        transforms.append(transform)
-    return OrbitCoordinates(plane, np.stack(centroids), np.stack(transforms))
-
-
-def winding_frequencies(coords: np.ndarray, times: np.ndarray) -> np.ndarray:
-    """|d angle / dt| of each trajectory in :class:`OrbitCoordinates` (N, T, 2), by least squares; shape (N,)."""
-    angle = np.unwrap(np.arctan2(coords[..., 1], coords[..., 0]), axis=1)
-    return np.abs(np.polyfit(times, angle.T, 1)[0])
-
-
-def initial_phases(coords: np.ndarray) -> np.ndarray:
-    """Angle in [0, 2 pi) of each trajectory's first latent point in :class:`OrbitCoordinates`; shape (N,)."""
-    return np.mod(np.arctan2(coords[:, 0, 1], coords[:, 0, 0]), 2 * np.pi)
-
-
-@dataclass
-class PhaseFit:
-    """Best circular-linear fit latent_phase = orientation * true_phase + offset (mod 2 pi).
-
-    Attributes:
-        orientation: +1 or -1, the sense of rotation relative to the true phase.
-        offset: Rotation between latent and true phase, in rad.
-        rms_error: Root-mean-square wrapped residual in rad; 0 means the latent
-            phase is an exact rotation/reflection of the true phase, random
-            phases give about 1.8.
-    """
-
-    orientation: int
-    offset: float
-    rms_error: float
-
-
-def fit_phase(latent: np.ndarray, true: np.ndarray) -> PhaseFit:
-    """How well latent phases (N,) are explained as a rotation or reflection of true phases (N,)."""
-    fits = []
-    for orientation in (1, -1):
-        diff = latent - orientation * true
-        offset = float(np.angle(np.mean(np.exp(1j * diff))))
-        residual = np.angle(np.exp(1j * (diff - offset)))
-        fits.append(PhaseFit(orientation, offset, float(np.sqrt(np.mean(residual**2)))))
-    return min(fits, key=lambda f: f.rms_error)
-
-
-def fit_phase_per_omega(latent: np.ndarray, true: np.ndarray, omegas: np.ndarray) -> dict[float, PhaseFit]:
-    """:func:`fit_phase` separately for every distinct omega (e.g. of a :func:`~neural_ode.data.parameter_grid`).
-
-    A separate offset per omega is needed because rotating each orbit by an
-    omega-dependent angle leaves every prediction unchanged, so the data
-    cannot fix a common offset.
-    """
-    return {float(w): fit_phase(latent[omegas == w], true[omegas == w]) for w in np.unique(omegas)}
-
-
-@dataclass
-class LatentDiagnostics:
-    """Frequency recovery of the learned latent orbits, per test trajectory.
-
-    Attributes:
-        frame: The :class:`OrbitFrame` the orbits are expressed in.
-        coords: Normalised per-trajectory coordinates (:class:`OrbitCoordinates`).
-        omega_true: True omega of each trajectory, shape (N,).
-        omega_hat: Winding frequency of each latent trajectory, shape (N,).
-    """
-
-    frame: OrbitFrame
-    coords: OrbitCoordinates
-    omega_true: np.ndarray
-    omega_hat: np.ndarray
-
-    def summary(self) -> dict[str, float]:
-        """Median relative error of omega_hat, and R^2 of omega_hat against the true omega (identity line)."""
-        rel_err = np.abs(self.omega_hat - self.omega_true) / self.omega_true
-        ss_res = np.sum((self.omega_hat - self.omega_true) ** 2)
-        ss_tot = np.sum((self.omega_true - self.omega_true.mean()) ** 2)
-        return {"omega_rel_error": float(np.median(rel_err)), "omega_hat_r2": float(1.0 - ss_res / ss_tot)}
-
-
-def latent_diagnostics(prediction: Prediction, data: TrajectoryData) -> LatentDiagnostics:
-    """:class:`LatentDiagnostics` for one model's predictions on an oscillator dataset (``data.params`` has "omega")."""
-    latents = prediction.latents
-    frame = orbit_frame(latents)
-    coords = orbit_coordinates(latents, frame)
-    return LatentDiagnostics(
-        frame=frame,
-        coords=coords,
-        omega_true=data.params["omega"],
-        omega_hat=winding_frequencies(coords(latents), data.times),
-    )
+def _param_dict(params: Any) -> dict[str, np.ndarray]:
+    """Parameters as {name: (N,) array}, whether stored as a dict or a structured array."""
+    if params is None:
+        return {}
+    if hasattr(params, "dtype") and params.dtype.names:
+        return {name: np.asarray(params[name], dtype=float) for name in params.dtype.names}
+    return {name: np.asarray(values, dtype=float) for name, values in dict(params).items()}

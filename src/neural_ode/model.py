@@ -3,7 +3,7 @@ from __future__ import annotations
 import torch
 from torch import nn
 
-from neural_ode.solvers import odeint_rk4
+from neural_ode.solvers import GRADIENT_METHODS, odeint
 
 
 def mlp(in_dim: int, hidden_dim: int, out_dim: int, n_hidden: int = 2) -> nn.Sequential:
@@ -90,6 +90,11 @@ class LatentODE(nn.Module):
     affine decoder avoids that basin without limiting expressivity.
     ``linear_decoder=True`` keeps only the affine map, restricting the latent
     space to affine images of the dynamics.
+
+    ``gradient`` chooses how training gradients pass through the ODE solve:
+    ``"backprop"`` through the unrolled RK4 steps, or ``"adjoint"`` by solving
+    the adjoint ODE backwards (see :mod:`neural_ode.solvers`). Predictions are
+    the same either way.
     """
 
     def __init__(
@@ -97,22 +102,27 @@ class LatentODE(nn.Module):
         obs_dim: int = 1,
         latent_dim: int = 2,
         hidden_dim: int = 64,
+        drift_hidden_dim: int = 64,
         encoder_hidden_dim: int = 32,
         steps_per_frame: int = 1,
         linear_decoder: bool = False,
+        gradient: str = "backprop",
     ):
         super().__init__()
+        if gradient not in GRADIENT_METHODS:
+            raise ValueError(f"gradient must be one of {GRADIENT_METHODS}, got {gradient!r}")
         self.latent_dim = latent_dim
         self.steps_per_frame = steps_per_frame
+        self.gradient = gradient
         self.encoder = GRUEncoder(obs_dim, latent_dim, encoder_hidden_dim)
-        self.drift = Drift(latent_dim, hidden_dim)
+        self.drift = Drift(latent_dim, drift_hidden_dim)
         self.decoder = (
             nn.Linear(latent_dim, obs_dim) if linear_decoder else SkipDecoder(latent_dim, hidden_dim, obs_dim)
         )
 
     def integrate(self, z0: torch.Tensor, times: torch.Tensor) -> torch.Tensor:
         """Latent trajectories from z0 of shape (B, latent_dim); returns (B, T, latent_dim)."""
-        return odeint_rk4(self.drift, z0, times, self.steps_per_frame).transpose(0, 1)
+        return odeint(self.drift, z0, times, self.steps_per_frame, self.gradient).transpose(0, 1)
 
     def forward(self, times: torch.Tensor, observations: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Reconstruct observed trajectories through the latent ODE.
